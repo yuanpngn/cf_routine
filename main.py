@@ -1,209 +1,557 @@
-import time
-import math
+#!/usr/bin/env python3
+import time, math, sys, select, json, socket, threading
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.crazyflie.log import LogConfig
 
 from cfutils import reset_estimator, hl_go_to_compat
 from takeoff import takeoff
-from hover import hover  # alias as hold below
+from hover import hover
 from circle import circle
 from spiral import spiral_arc
-from curves import expressive_curves
-from slowing_circles import slowing_circles
+from figure8_horizontal import horizontal_figure8
+from wave import wave_orbit, sphere_gesture
 from land import land
 
 URI = "radio://0/80/2M"
 
-# -----------------------------
-# Show parameters
-# -----------------------------
-# Heights (meters)
-CHEST_Z = 1.2
-HIGH_Z  = 1.8
+# =========================
+# UDP Streaming Configuration
+# =========================
+# Enable/disable UDP streaming to Unity
+# Set UDP_ENABLED = True to stream real-time pose data to Unity for visualization
+# Packet format matches mock_pos.py: {"x": float, "y": float, "z": float, "yaw_deg": float, "ts": float}
+# Unity coordinate mapping: unityX = -cfY, unityY = cfZ, unityZ = cfX
+UDP_ENABLED = True          # Set to False to disable UDP streaming
+UDP_IP = "172.20.10.2"        # Destination IP (127.0.0.1 for local Unity, or Quest IP)
+UDP_PORT = 5005             # Destination port (must match Unity receiver)
+UDP_HZ = 30.0               # Send rate (Hz)
 
-# Speeds
-ASCENT_VEL  = 0.7
-DESCENT_VEL = 0.25  # gentler landing
+# =========================
+# Global choreo parameters
+# =========================
+# Coordinate system:
+# - Performer is at origin (0, 0, 0)
+# - Positive Y is in front of the performer (toward audience)
+# - Positive X is to the performer's right
+# - Positive Z is upward
 
-# Forbidden box: |x| < 0.5, |y| < 0.5 (1×1). We will stay strictly outside.
-BOX_HALF   = 0.5
-OUT_MARGIN = 0.10
-OUT        = BOX_HALF + OUT_MARGIN  # 0.6 m
+H_STD   = 1.3    # standard height (m)
+H_LOW   = 1.2    # diagonal phase base height (m)
+H_MAX   = 2.0    # spiral/wave max height (m)
 
-# Circle defaults (use radius outside the 1×1 box)
-CIRCLE_R      = 0.70         # >= OUT to stay outside
-CIRCLE_SEG    = 72
-FACE_CENTER   = True
-WORLD_YAW_OFF = 0.0
+# "Center front" = 1 meter in front of the performer
+CENTER_FRONT_Y = 1.0
 
-# Convenience
-hold = hover
+RETREAT_DIST = 1.5  # additional distance back from center front (m)
+SIDE_DIST    = 1.0  # left/right from center line (m)
+CIRCLE_R     = 1.2 # orbit radius around performer (m)
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def goto(hl, x, y, z, dur):
-    """Absolute go_to with duration and a short slack sleep."""
-    hl_go_to_compat(hl, x=x, y=y, z=z, duration_s=dur, relative=False)
-    time.sleep(dur + 0.05)
+# Diagonal movement parameters (1:26-1:50)
+DIAG_HORIZONTAL = 1.5  # horizontal distance per diagonal pass (m)
+DIAG_VERTICAL   = 0.4  # height change per diagonal pass (m) - reduced from 0.7 for gentler slope
 
-def nod(hl, amp=0.12, t_each=0.35):
-    """Readiness cue at absolute height (no relative)."""
-    goto(hl, 0.0, 0.0, max(0.15, CHEST_Z - amp), t_each)
-    goto(hl, 0.0, 0.0, CHEST_Z, t_each)
+ASCENT_VEL   = 0.7
+DESCENT_VEL  = 0.125
 
-# Perimeter points (8-point ring around the forbidden square)
-P = {
-    "E":  (+OUT, 0.0),
-    "NE": (+OUT, +OUT),
-    "N":  (0.0,  +OUT),
-    "NW": (-OUT, +OUT),
-    "W":  (-OUT, 0.0),
-    "SW": (-OUT, -OUT),
-    "S":  (0.0,  -OUT),
-    "SE": (+OUT, -OUT),
+FACE_CENTER  = True
+YAW_OFF_DEG  = 0.0
+
+# Named absolute points in the stage plane (x,y)
+# Performer at (0,0), drone operates at y=CENTER_FRONT_Y normally
+POINTS = {
+    "CENTER":  (0.0, CENTER_FRONT_Y),                    # 1m in front of performer
+    "RIGHT":   (+SIDE_DIST, CENTER_FRONT_Y),             # 1m right of center front
+    "LEFT":    (-SIDE_DIST, CENTER_FRONT_Y),             # 1m left of center front
+    "RETREAT": (0.0, 1.8),     # 1.5m back from center front, it ung 1.8
 }
 
-def route_along_perimeter(hl, names, z, seg_t):
-    """
-    Move along the outer square only through adjacent perimeter points,
-    so we never cut through the inside box.
-    """
-    for name in names:
-        x, y = P[name]
-        goto(hl, x, y, z, seg_t)
+SLACK = 0.05  # timing slack after each commanded segment
 
-def move_edge_safe(hl, start_name, end_name, z, seg_t):
+# Global flag for emergency landing
+emergency_stop = False
+
+# Global variables for UDP streaming
+udp_sock = None
+latest_pose = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw_deg": 0.0, "ts": 0.0}
+pose_lock = threading.Lock()
+streaming_active = False
+
+def check_keyboard_input():
+    """Check if any keyboard input is available (non-blocking)."""
+    if sys.platform == 'win32':
+        import msvcrt
+        return msvcrt.kbhit()
+    else:
+        # Unix/Linux/Mac
+        return select.select([sys.stdin], [], [], 0)[0] != []
+
+def pose_callback(timestamp, data, logconf):
+    """Callback for Crazyflie pose logging - updates global pose for UDP streaming."""
+    global latest_pose
+    with pose_lock:
+        latest_pose = {
+            "x": data['stateEstimate.x'],
+            "y": data['stateEstimate.y'],
+            "z": data['stateEstimate.z'],
+            "yaw_deg": data['stabilizer.yaw'],  # or 'stateEstimate.yaw' if available
+            "ts": time.time()
+        }
+
+def udp_streaming_thread():
+    """Background thread that sends pose data over UDP at specified rate."""
+    global streaming_active, udp_sock
+    dt = 1.0 / UDP_HZ
+    
+    while streaming_active:
+        try:
+            with pose_lock:
+                pkt = latest_pose.copy()
+            
+            # Send UDP packet
+            if udp_sock:
+                udp_sock.sendto(json.dumps(pkt).encode("utf-8"), (UDP_IP, UDP_PORT))
+            
+            time.sleep(dt)
+        except Exception as e:
+            print(f"[UDP] Error sending: {e}")
+            time.sleep(dt)
+
+def setup_pose_logging(cf):
+    """Set up Crazyflie logging for position and orientation."""
+    log_conf = LogConfig(name='Pose', period_in_ms=33)  # ~30Hz
+    
+    # Add pose variables to log
+    log_conf.add_variable('stateEstimate.x', 'float')
+    log_conf.add_variable('stateEstimate.y', 'float')
+    log_conf.add_variable('stateEstimate.z', 'float')
+    log_conf.add_variable('stabilizer.yaw', 'float')
+    
+    # Register callback
+    cf.log.add_config(log_conf)
+    log_conf.data_received_cb.add_callback(pose_callback)
+    log_conf.start()
+    
+    return log_conf
+
+def goto(hl, xy, z, dur, face_performer=True):
+    """Absolute go_to with duration + small slack. Checks for keyboard input during movement.
+    
+    Args:
+        hl: High-level commander
+        xy: Target (x, y) position tuple
+        z: Target z height
+        dur: Duration in seconds
+        face_performer: If True, drone faces performer at (0,0). If False, maintains current yaw.
     """
-    Move between two perimeter points WITHOUT crossing the inside.
-    If they are opposite sides (e.g., E -> W), we go via the top edge by default.
-    """
-    order = ["E","NE","N","NW","W","SW","S","SE"]  # clockwise
-    idx = {n:i for i,n in enumerate(order)}
-    si, ei = idx[start_name], idx[end_name]
+    global emergency_stop
+    from cfutils import face_center_yaw_deg
+    
+    x, y = xy
+    
+    # Calculate yaw to face performer at origin (0, 0)
+    if face_performer:
+        yaw_deg = face_center_yaw_deg(x, y, 0.0, 0.0, YAW_OFF_DEG)
+    else:
+        yaw_deg = None
+    
+    hl_go_to_compat(hl, x=x, y=y, z=z, yaw_deg=yaw_deg, duration_s=dur, relative=False)
+    
+    # Sleep in small increments to check for keyboard input
+    elapsed = 0
+    interval = 0.1
+    total_sleep = dur + SLACK
+    
+    while elapsed < total_sleep:
+        if check_keyboard_input():
+            emergency_stop = True
+            raise KeyboardInterrupt("Keyboard input detected - initiating smooth landing")
+        time.sleep(min(interval, total_sleep - elapsed))
+        elapsed += interval
 
-    # Compute clockwise and counter-clockwise paths and choose the shorter
-    def path(cw=True):
-        path = []
-        i = si
-        while i != ei:
-            i = (i + (1 if cw else -1)) % len(order)
-            path.append(order[i])
-        return path
+def safe_sleep(duration):
+    """Sleep with keyboard input checking."""
+    global emergency_stop
+    elapsed = 0
+    interval = 0.1
+    
+    while elapsed < duration:
+        if check_keyboard_input():
+            emergency_stop = True
+            raise KeyboardInterrupt("Keyboard input detected - initiating smooth landing")
+        time.sleep(min(interval, duration - elapsed))
+        elapsed += interval
 
-    cw_path  = path(True)
-    ccw_path = path(False)
-    chosen = cw_path if len(cw_path) <= len(ccw_path) else ccw_path
-    route_along_perimeter(hl, chosen, z, seg_t)
-
-if __name__ == "__main__":
-    cflib.crtp.init_drivers()
+def main():
+    global emergency_stop, udp_sock, streaming_active
+    cflib.crtp.init_drivers(enable_debug_driver=False)
+    
+    # Initialize UDP socket if enabled
+    if UDP_ENABLED:
+        try:
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            print(f"[UDP] Initialized - sending to {UDP_IP}:{UDP_PORT} at {UDP_HZ}Hz")
+        except Exception as e:
+            print(f"[UDP] Failed to initialize: {e}")
+            udp_sock = None
+    
     with SyncCrazyflie(URI, cf=Crazyflie(rw_cache='./cache')) as scf:
         cf = scf.cf
+        current_height = 0.0  # Track current height for emergency landing
+        log_conf = None
+        udp_thread = None
 
-        # Enable High-Level commander & ensure motor override off
+        # High-level + safety setup
         cf.param.set_value('commander.enHighLevel', '1')
         try:
             cf.param.set_value('motorPowerSet.enable', '0')
         except Exception:
             pass
 
-        # Brushless: arm
-        cf.platform.send_arming_request(True)
+        # Brushless arming (no-op on some platforms)
+        try:
+            cf.platform.send_arming_request(True)
+        except Exception:
+            pass
         time.sleep(0.3)
         print("[ARM] Armed.")
+        print("[INFO] Press any key at any time to initiate emergency smooth landing...")
+        
+        # Set up pose logging for UDP streaming
+        if UDP_ENABLED and udp_sock:
+            try:
+                log_conf = setup_pose_logging(cf)
+                time.sleep(0.5)  # Let logging stabilize
+                
+                # Start UDP streaming thread
+                streaming_active = True
+                udp_thread = threading.Thread(target=udp_streaming_thread, daemon=True)
+                udp_thread.start()
+                print("[UDP] Streaming started")
+            except Exception as e:
+                print(f"[UDP] Failed to start logging: {e}")
 
         try:
             reset_estimator(cf)
             hl = cf.high_level_commander
 
-            # ==============================
-            # Pre-Dance (~5 s)
-            # ==============================
-            takeoff(hl, height_m=CHEST_Z, ascent_vel=ASCENT_VEL)
-            hold(hl, 0.6)
-            nod(hl, amp=0.12, t_each=0.35)  # readiness cue
+            # =========================
+            # Pre-Dance (0:00–0:15)
+            # =========================
+            # Initial placement: Drone is on the ground at center front (0, 1.0, 0.0)
+            # facing the performer (toward negative Y direction).
 
-            # ==================================
-            # During Dance (0:00–3:27)
-            # ==================================
+            # Takeoff from ground to 1.5 m at center front position
+            print("[DEBUG] Sending takeoff command...")
+            takeoff(hl, height_m=H_STD, ascent_vel=ASCENT_VEL)
+            print("[DEBUG] Takeoff command issued.")
+            current_height = H_STD
+            # goto(hl, POINTS["CENTER"], H_STD, 0.0)   # ensure we're at center front (0, -1.0, 1.5)
 
-            # 0:00–0:42 Flow Intro — outer circle (always outside the 1×1)
-            circle(
-                hl, cx=0.0, cy=0.0, z=CHEST_Z,
-                radius=CIRCLE_R, total_time=18.0,
-                segments=CIRCLE_SEG, face_center=FACE_CENTER,
-                world_yaw_offset_deg=WORLD_YAW_OFF
-            )
+            # 0:00–0:05 Hover
+            hover(hl, 5.0)
+            print("[DEBUG] hover command issued.")
+            
 
-            # Finish intro with a quick outer square “diamond” (still outside)
-            # E -> NE -> N -> NW -> W -> center-OUT on x (east) to reset facing
-            route_along_perimeter(hl, ["E","NE","N","NW","W","NW","N","NE","E"], z=CHEST_Z, seg_t=0.8)
-            hold(hl, 2.0)
+            # 0:05–0:10 Retreat farther back (~1.5 m total from dancer)
+            goto(hl, POINTS["RETREAT"], H_STD, 5.0)
+            print("[DEBUG] retreat command issued.")
+            
+            # 0:10–0:15 Approach again to 1 m in front of dancer
+            goto(hl, POINTS["CENTER"], H_STD, 5.0)
+            print("[DEBUG] center command issued.")
+            
+            # =========================
+            # Main Dance (0:16–3:30)
+            # =========================
 
-            # 0:42–1:09 (27 s) — Approach & Retreat cycles (outside only)
-            # Cycle: East edge -> via North edge -> West edge -> back to East via South edge
-            # Each long traverse ~8–9 s across three perimeter hops
-            for _ in range(3):
-                # Start at E (ensure we are at E)
-                goto(hl, *P["E"], CHEST_Z, 1.0)
-                move_edge_safe(hl, "E", "W", CHEST_Z, seg_t=2.7)  # E->NE->N->NW->W (no interior)
-                hold(hl, 0.5)
-                move_edge_safe(hl, "W", "E", CHEST_Z, seg_t=2.7)  # W->SW->S->SE->E
-                hold(hl, 0.5)
+            # 0:16–0:20 Fly right (~1 m)
+            goto(hl, POINTS["RIGHT"], H_STD, 4.0)
+            print("[DEBUG] right command issued.")
+            
+            # 0:21–0:23 Hover
+            hover(hl, 2.0)
 
-            # 1:09–1:30 (21 s) — Perimeter weave (figure-8 replacement, still outside)
-            route_along_perimeter(hl, ["E","NE","N","NW","W","SW","S","SE","E"], z=CHEST_Z, seg_t=2.3)
+            # 0:23–0:29 Back to center
+            goto(hl, POINTS["CENTER"], H_STD, 6.0)
 
-            # 1:30–1:57 (27 s) — Spiral Arc (radius outside the box)
-            spiral_arc(hl, cx=0.0, cy=0.0, z_start=CHEST_Z, z_end=HIGH_Z,
-                       radius=max(CIRCLE_R, 0.7), segments=12, seg_t=1.1)
-            # gentle absolute descend back to CHEST_Z (no relative)
-            goto(hl, 0.0, 0.0, CHEST_Z, 4.0)
+            # 0:30–0:36 Fly left (~1 m)
+            goto(hl, POINTS["LEFT"], H_STD, 6.0)
 
-            # 1:57–2:20 (23 s) — Outer “diagonal” sweeps implemented as perimeter routes
-            # E -> N -> W (via north edge), then back W -> S -> E (via south edge)
-            move_edge_safe(hl, "E", "W", CHEST_Z, seg_t=2.6)
-            hold(hl, 1.0)
-            move_edge_safe(hl, "W", "E", CHEST_Z, seg_t=2.6)
-            hold(hl, 1.0)
+            # 0:37–0:40 Hover
+            hover(hl, 3.0)
 
-            # 2:20–2:50 (30 s) — Expressive Curves (two arcs fully outside)
-            expressive_curves(hl, cx=0.0, cy=0.0, z=CHEST_Z,
-                              total_s=30.0, radii=(0.85, 0.70),
-                              segments=CIRCLE_SEG, face_center=FACE_CENTER,
-                              world_yaw_offset_deg=WORLD_YAW_OFF)
+            # 0:40–0:46 Back to center
+            goto(hl, POINTS["CENTER"], H_STD, 6.0)
 
-            # 2:50–3:20 (30 s) — Slowing Circles (outside)
-            slowing_circles(hl, cx=0.0, cy=0.0, z=CHEST_Z, radius=0.75,
-                            times=(12.0, 10.0, 8.0), segments=CIRCLE_SEG,
-                            face_center=FACE_CENTER, world_yaw_offset_deg=WORLD_YAW_OFF)
+            # 0:46–1:15 Circle around performer (flat at 1.5m height), end at center front
+            # Circle center = performer position (0, 0), radius = 0.8m
+            # Center front is at (0, 1.0) which is 1.0m from origin
+            # Since radius is 0.8m, center front is OUTSIDE the circle!
+            # We need to move to the circle's starting point first (top of circle at 90°)
+            # Top of circle: (0, 0.8) when radius=0.8m and center=(0,0)
+            
+            # Move to top of circle to start
+            goto(hl, (0.0, 1.0), H_STD, 0.5)
+            
+            # First circle (14.5 seconds) - faster orbit
+            start_angle_deg = 90.0
+            circle(hl,
+                   cx=0.0, cy=0.0, z=H_STD,
+                   radius=CIRCLE_R, total_time=14.5,
+                   segments=45, face_center=FACE_CENTER,
+                   world_yaw_offset_deg=YAW_OFF_DEG,
+                   start_angle_deg=start_angle_deg)
+            
+            # Second circle (14.5 seconds) - same speed, continues smoothly
+            circle(hl,
+                   cx=0.0, cy=0.0, z=H_STD,
+                   radius=CIRCLE_R, total_time=14.5,
+                   segments=45, face_center=FACE_CENTER,
+                   world_yaw_offset_deg=YAW_OFF_DEG,
+                   start_angle_deg=start_angle_deg)
+            
+            # Return to center front after circles
+            goto(hl, POINTS["CENTER"], H_STD, 0.6)
 
-            # 3:20–3:27 (7 s) — End Prep: hold at East edge
-            goto(hl, *P["E"], CHEST_Z, 2.5)
-            hold(hl, 4.5)
+            # 1:16–1:20 Retreat
+            goto(hl, POINTS["RETREAT"], H_STD, 4.0)
 
-            # ==============================
-            # Post-Dance (3:27–3:50)
-            # ==============================
-            # Retreat along perimeter toward wing (E -> SE), then land
-            goto(hl, *P["SE"], CHEST_Z, 4.0)
-            hold(hl, 1.0)
-            # Short settle and land from CHEST_Z with gentle descent velocity
-            land(hl, from_height_m=CHEST_Z, descent_vel=DESCENT_VEL)
+            # 1:21–1:26 Approach
+            goto(hl, POINTS["CENTER"], H_STD, 5.0)
+
+            # 1:26–1:50 Diagonal movements while circling around the performer
+            # 8 passes × 3 seconds each = 24 seconds total
+            # Each pass: move 1.5m horizontal distance + change 1.2m in height
+            # Alternating upward and downward diagonals
+            
+            # Calculate positions around the performer (orbit at radius)
+            num_diag_passes = 10
+            orbit_radius = CIRCLE_R
+            angle_step = (2.0 * math.pi) / num_diag_passes
+            
+            for i in range(num_diag_passes):
+                mode = "up" if i % 2 == 0 else "down"
+                
+                # Calculate horizontal positions (moving around performer)
+                angle_start = i * angle_step
+                angle_end = (i + 1) * angle_step
+                
+                # Starting position for this diagonal
+                x_start = orbit_radius * math.cos(angle_start)
+                y_start = orbit_radius * math.sin(angle_start)
+                
+                # Ending position (1.5m horizontal distance away)
+                x_end = orbit_radius * math.cos(angle_end)
+                y_end = orbit_radius * math.sin(angle_end)
+                
+                # Height changes: alternating up (+1.2m) and down (-1.2m)
+                if mode == "up":
+                    z_start = H_LOW
+                    z_end = H_LOW + DIAG_VERTICAL  # +1.2m height
+                    current_height = z_end
+                else:
+                    z_start = H_LOW + DIAG_VERTICAL
+                    z_end = H_LOW  # -1.2m height
+                    current_height = z_end
+
+                # Execute diagonal movement (2.4 seconds per pass)
+                hl_go_to_compat(hl, x_end, y_end, z_end, duration_s=2.4, relative=False)
+                safe_sleep(2.4 + SLACK)
+
+            # Return to center front at H_STD to prep spiral
+            goto(hl, POINTS["CENTER"], H_STD, 2.5)
+            current_height = H_STD
+
+            # 1:50–2:20 Horizontal figure-8 pattern (overlapping circles in front of dancer)
+            # Creates a twisting horizontal spiral effect with overlapping circles
+            # horizontal_figure8(hl,
+            #                   cx=0.0, cy=CENTER_FRONT_Y,  # Center at center front position
+            #                   z=H_STD,
+            #                   width=1.2,  # Width of figure-8
+            #                   height_var=0.3,  # Slight height variation
+            #                   total_time=30.0,
+            #                   segments=60,
+            #                   face_center=FACE_CENTER,
+            #                   world_yaw_offset_deg=YAW_OFF_DEG)
+            
+            start_angle_deg = 90.0
+            circle(hl,
+                   cx=0.0, cy=0.0, z=H_STD,
+                   radius=CIRCLE_R, total_time=9.67,
+                   segments=30, face_center=FACE_CENTER,
+                   world_yaw_offset_deg=YAW_OFF_DEG,
+                   start_angle_deg=start_angle_deg)
+            
+            # Second circle (9.67 seconds)
+            circle(hl,
+                   cx=0.0, cy=0.0, z=H_STD,
+                   radius=CIRCLE_R, total_time=9.67,
+                   segments=30, face_center=FACE_CENTER,
+                   world_yaw_offset_deg=YAW_OFF_DEG,
+                   start_angle_deg=start_angle_deg)
+            
+            # Third circle (9.67 seconds)
+            circle(hl,
+                   cx=0.0, cy=0.0, z=H_STD,
+                   radius=CIRCLE_R, total_time=9.67,
+                   segments=30, face_center=FACE_CENTER,
+                   world_yaw_offset_deg=YAW_OFF_DEG,
+                   start_angle_deg=start_angle_deg)
+            
+            # End at center front
+            goto(hl, POINTS["CENTER"], H_STD, 0.8)
+            current_height = H_STD
+
+            # 2:21–2:43 Diagonal Retreat/Approach blocks with hovers
+            # 2:21–2:25 Retreat
+            goto(hl, POINTS["RETREAT"], H_STD, 4.0)
+            # 2:25–2:28 Hover
+            hover(hl, 3.0)
+            # 2:28–2:32 Approach
+            goto(hl, POINTS["CENTER"], H_STD, 4.0)
+            # 2:32–2:36 Retreat
+            goto(hl, POINTS["RETREAT"], H_STD, 4.0)
+            # 2:36–2:39 Hover
+            hover(hl, 3.0)
+            # 2:39–2:43 Approach
+            goto(hl, POINTS["CENTER"], H_STD, 4.0)
+
+            # 2:43–2:51 Draw a "sphere" gesture at center front (smooth 3D loop)
+            # sphere_gesture(hl,
+            #                cx=0.0, cy=0.0,
+            #                z_center=H_STD,
+            #                radius=0.35,
+            #                total_time=8.0,
+            #                segments=64,
+            #                face_center=FACE_CENTER,
+            #                world_yaw_offset_deg=YAW_OFF_DEG)
+
+            # start_angle_deg = 90.0
+            # circle(hl,
+            #        cx=0.0, cy=0.0, z=H_STD,
+            #        radius=CIRCLE_R, total_time=8.0,
+            #        segments=30, face_center=FACE_CENTER,
+            #        world_yaw_offset_deg=YAW_OFF_DEG,
+            #        start_angle_deg=start_angle_deg)
+            
+            
+            # 2:51–3:30 Wave path while circling (smooth sine height, slows near end)
+            # wave_orbit(hl,
+            #            cx=0.0, cy=0.0,
+            #            z_min=H_STD, z_max=H_MAX,
+            #            radius=CIRCLE_R,
+            #            total_time=39.0,
+            #            cycles=3.0,          # vertical wave cycles
+            #            segments=156,        # smooth
+            #            face_center=FACE_CENTER,
+            #            world_yaw_offset_deg=YAW_OFF_DEG)
+            
+            # Calculate positions around the performer (orbit at radius)
+            num_diag_passes = 10
+            orbit_radius = CIRCLE_R
+            angle_step = (2.0 * math.pi) / num_diag_passes
+            
+            for i in range(num_diag_passes):
+                mode = "up" if i % 2 == 0 else "down"
+                
+                # Calculate horizontal positions (moving around performer)
+                angle_start = i * angle_step
+                angle_end = (i + 1) * angle_step
+                
+                # Starting position for this diagonal
+                x_start = orbit_radius * math.cos(angle_start)
+                y_start = orbit_radius * math.sin(angle_start)
+                
+                # Ending position (1.5m horizontal distance away)
+                x_end = orbit_radius * math.cos(angle_end)
+                y_end = orbit_radius * math.sin(angle_end)
+                
+                # Height changes: alternating up (+1.2m) and down (-1.2m)
+                if mode == "up":
+                    z_start = H_LOW
+                    z_end = H_LOW + DIAG_VERTICAL  # +1.2m height
+                    current_height = z_end
+                else:
+                    z_start = H_LOW + DIAG_VERTICAL
+                    z_end = H_LOW  # -1.2m height
+                    current_height = z_end
+                
+                # Execute diagonal movement (3 seconds per pass)
+                hl_go_to_compat(hl, x_end, y_end, z_end, duration_s=3.9, relative=False)
+                safe_sleep(3.9 + SLACK)
+
+            # Ensure we finish at center front
+            goto(hl, POINTS["CENTER"], H_STD, 0.8)
+
+            # =========================
+            # Post-Dance (3:30–3:43+)
+            # =========================
+            # 3:30–3:35 Retreat ~1.5 m
+            goto(hl, POINTS["RETREAT"], H_STD, 5.0)
+            # 3:35–3:43 Approach to center front
+            goto(hl, POINTS["CENTER"], H_STD, 8.0)
+
+            # Descent & landing
+            land(hl, from_height_m=H_STD, descent_vel=DESCENT_VEL)
+            current_height = 0.0
             print("[DONE] Landed.")
 
         except KeyboardInterrupt:
-            print("[ABORT] KeyboardInterrupt — stopping HL.")
+            print("\n[EMERGENCY] Keyboard input detected — initiating smooth emergency landing...")
             try:
+                # Stop current high-level commands
                 cf.high_level_commander.stop()
-            except Exception:
-                pass
+                time.sleep(0.2)
+                
+                # Perform smooth emergency landing from current height
+                # Estimate height (use last known height or default to H_STD)
+                emergency_height = current_height if current_height > 0 else H_STD
+                print(f"[EMERGENCY] Landing from approximately {emergency_height:.2f}m...")
+                
+                # Smooth descent at safe velocity
+                land(hl, from_height_m=emergency_height, descent_vel=DESCENT_VEL)
+                print("[EMERGENCY] Emergency landing completed.")
+            except Exception as e:
+                print(f"[ERROR] Error during emergency landing: {e}")
+                # Final fallback - send stop command
+                try:
+                    cf.high_level_commander.stop()
+                except Exception:
+                    pass
         finally:
+            # Stop UDP streaming
+            if UDP_ENABLED and streaming_active:
+                streaming_active = False
+                if udp_thread:
+                    udp_thread.join(timeout=1.0)
+                print("[UDP] Streaming stopped")
+            
+            # Stop logging
+            if log_conf:
+                try:
+                    log_conf.stop()
+                except Exception:
+                    pass
+            
+            # Close UDP socket
+            if udp_sock:
+                try:
+                    udp_sock.close()
+                except Exception:
+                    pass
+            
+            # Stop drone commands
             try:
                 cf.commander.send_stop_setpoint()
             except Exception:
                 pass
-            cf.platform.send_arming_request(False)
+            try:
+                cf.platform.send_arming_request(False)
+            except Exception:
+                pass
             print("[DISARM] Disarmed.")
+
+if __name__ == "__main__":
+    main()

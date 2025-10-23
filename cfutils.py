@@ -1,4 +1,3 @@
-# cfutils.py
 import time, math, logging, inspect
 logging.basicConfig(level=logging.INFO)
 
@@ -9,12 +8,14 @@ def reset_estimator(cf):
 
 def call_with_keywords(func, kwargs_ordered):
     sig = inspect.signature(func)
-    names = [p for p in sig.parameters.keys()]
-    call_kwargs = {k:v for (k,v) in kwargs_ordered if k in names}
-    missing = [n for n,p in sig.parameters.items()
+    names = list(sig.parameters.keys())
+    call_kwargs = {k: v for (k, v) in kwargs_ordered if k in names and v is not None}
+    missing = [n for n, p in sig.parameters.items()
                if p.default is inspect._empty and n not in call_kwargs]
     if missing:
-        raise TypeError(f"{func.__name__} requires {missing} (keys: {names})")
+        # Best-effort: allow if func tolerates missing (some firmwares)
+        # but raise for clarity in dev environments
+        raise TypeError(f"{func.__name__} requires {missing} (available keys: {names})")
     return func(**call_kwargs)
 
 # ---------- HL compat: takeoff / land ----------
@@ -26,10 +27,13 @@ def hl_takeoff_compat(hl, height_m, ascent_vel=0.6):
             ('duration_s', max(1.0, height_m / max(0.1, ascent_vel))),
         ])
     except Exception:
-        try: return hl.takeoff(height_m, ascent_vel)
+        try:
+            return hl.takeoff(height_m, ascent_vel)
         except Exception:
-            try: return hl.takeoff(height_m, max(1.0, height_m / max(0.1, ascent_vel)))
-            except Exception: return hl.takeoff(height_m)
+            try:
+                return hl.takeoff(height_m, max(1.0, height_m / max(0.1, ascent_vel)))
+            except Exception:
+                return hl.takeoff(height_m)
 
 def hl_land_compat(hl, from_height_m, descent_vel=0.4):
     duration = max(1.5, from_height_m / max(0.1, descent_vel))
@@ -40,21 +44,21 @@ def hl_land_compat(hl, from_height_m, descent_vel=0.4):
             ('duration_s', duration),
         ])
     except Exception:
-        for attempt in [
+        for attempt in (
             lambda: hl.land(descent_vel, duration),
             lambda: hl.land(0.0,       duration),
             lambda: hl.land(duration),
-        ]:
-            try: return attempt()
-            except Exception: pass
-        # as last resort try height-only
+        ):
+            try:
+                return attempt()
+            except Exception:
+                pass
         return call_with_keywords(hl.land, [('height', 0.0)])
 
 # ---------- HL compat: absolute go_to ----------
 def hl_go_to_compat(hl, x, y, z, *, yaw_deg=None, duration_s=None, relative=False):
     """
-    Use for ABSOLUTE setpoints. Avoid using `relative=True` here;
-    use hl_move_distance_compat for relative steps.
+    Preferred for ABSOLUTE setpoints.
     """
     try:
         return call_with_keywords(hl.go_to, [
@@ -69,8 +73,7 @@ def hl_go_to_compat(hl, x, y, z, *, yaw_deg=None, duration_s=None, relative=Fals
             yaw_rad = math.radians(yaw_deg) if yaw_deg is not None else 0.0
             if duration_s is not None:
                 return hl.go_to(x, y, z, yaw_rad, duration_s)
-            else:
-                return hl.go_to(x, y, z, yaw_rad)
+            return hl.go_to(x, y, z, yaw_rad)
         except Exception:
             if duration_s is not None:
                 return call_with_keywords(hl.go_to, [
@@ -84,24 +87,22 @@ def hl_move_distance_compat(hl, dx, dy, dz, *, duration_s=None, velocity=None):
     """
     SAFE relative motion. Preferred for diag/forward/left/backward/upward/downward.
     """
-    # preferred: explicit keywords
     try:
         return call_with_keywords(hl.move_distance, [
             ('x', dx), ('y', dy), ('z', dz),
             ('duration_s', duration_s), ('velocity', velocity),
         ])
     except Exception:
-        # positional duration if available
         try:
             if duration_s is not None:
                 return hl.move_distance(dx, dy, dz, duration_s)
             else:
                 return hl.move_distance(dx, dy, dz)
         except Exception:
-            # velocity-only variant
             if velocity is not None:
+                # final attempt: some firmwares accept only velocity + xyz keywords
                 return call_with_keywords(hl.move_distance, [
-                    ('x', dx), ('y', y), ('z', dz),  # NOTE: keep api robust
+                    ('x', dx), ('y', dy), ('z', dz),
                     ('velocity', velocity),
                 ])
             raise RuntimeError("move_distance not supported; aborting relative move.")

@@ -1,4 +1,3 @@
-# downward.py
 from cfutils import hl_move_distance_compat
 import time
 
