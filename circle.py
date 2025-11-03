@@ -1,5 +1,6 @@
-import time, math
+import math
 from cfutils import hl_go_to_compat, face_center_yaw_deg
+from safe_sleep import safe_sleep
 
 def circle(hl, *, cx=0.0, cy=0.0, z=1.5, radius=1.2, total_time=20.0,
            segments=72, face_center=True, world_yaw_offset_deg=0.0, start_angle_deg=0.0):
@@ -19,4 +20,4 @@ def circle(hl, *, cx=0.0, cy=0.0, z=1.5, radius=1.2, total_time=20.0,
         yaw_deg = (face_center_yaw_deg(px, py, cx, cy, world_yaw_offset_deg)
                    if face_center else None)
         hl_go_to_compat(hl, px, py, z, yaw_deg=yaw_deg, duration_s=dt, relative=False)
-        time.sleep(dt)
+        safe_sleep(dt)
