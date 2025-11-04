@@ -41,15 +41,15 @@ H_STD   = 1.3    # standard height (m)
 H_LOW   = 1.2    # diagonal phase base height (m)
 H_MAX   = 2.0    # spiral/wave max height (m)
 
-# "Center front" = 1 meter in front of the performer
-CENTER_FRONT_Y = 1.0
+# "Center front" = 0.5 meter in front of the performer (Original 1.0m)
+CENTER_FRONT_Y = 0.5
 
 RETREAT_DIST = 1.5  # additional distance back from center front (m)
-SIDE_DIST    = 1.0  # left/right from center line (m)
-CIRCLE_R     = 1.2 # orbit radius around performer (m)
+SIDE_DIST    = 0.5  # left/right from center line (m) (Original 1.0m)
+CIRCLE_R     = 0.7 # orbit radius around performer (m) (Original 1.2m)
 
 # Diagonal movement parameters (1:26-1:50)
-DIAG_HORIZONTAL = 1.5  # horizontal distance per diagonal pass (m)
+DIAG_HORIZONTAL = 1.0  # horizontal distance per diagonal pass (m) (Original 1.5m)
 DIAG_VERTICAL   = 0.4  # height change per diagonal pass (m) - reduced from 0.7 for gentler slope
 
 ASCENT_VEL   = 0.7
@@ -61,10 +61,10 @@ YAW_OFF_DEG  = 0.0
 # Named absolute points in the stage plane (x,y)
 # Performer at (0,0), drone operates at y=CENTER_FRONT_Y normally
 POINTS = {
-    "CENTER":  (0.0, CENTER_FRONT_Y),                    # 1m in front of performer
-    "RIGHT":   (+SIDE_DIST, CENTER_FRONT_Y),             # 1m right of center front
-    "LEFT":    (-SIDE_DIST, CENTER_FRONT_Y),             # 1m left of center front
-    "RETREAT": (0.0, 1.8),     # 1.5m back from center front, it ung 1.8
+    "CENTER":  (0.0, CENTER_FRONT_Y),                    # 0.5m in front of performer
+    "RIGHT":   (+SIDE_DIST, CENTER_FRONT_Y),             # 0.5m right of center front
+    "LEFT":    (-SIDE_DIST, CENTER_FRONT_Y),             # 0.5m left of center front
+    "RETREAT": (0.0, 1.3),     # 1.3m from performer (Original 1.8m)
 }
 
 SLACK = 0.05  # timing slack after each commanded segment
@@ -213,7 +213,7 @@ def main():
             # =========================
             # Pre-Dance (0:00–0:15)
             # =========================
-            # Initial placement: Drone is on the ground at center front (0, 1.0, 0.0)
+            # Initial placement: Drone is on the ground at center front (0, 0.5, 0.0)
             # facing the performer (toward negative Y direction).
 
             # Takeoff from ground to 1.5 m at center front position
@@ -221,18 +221,18 @@ def main():
             takeoff(hl, height_m=H_STD, ascent_vel=ASCENT_VEL)
             print("[DEBUG] Takeoff command issued.")
             current_height = H_STD
-            # goto(hl, POINTS["CENTER"], H_STD, 0.0)   # ensure we're at center front (0, -1.0, 1.5)
+            # goto(hl, POINTS["CENTER"], H_STD, 0.0)   # ensure we're at center front
 
             # 0:00–0:05 Hover
             hover(hl, 5.0)
             print("[DEBUG] hover command issued.")
             
 
-            # 0:05–0:10 Retreat farther back (~1.5 m total from dancer)
+            # 0:05–0:10 Retreat farther back
             goto(hl, POINTS["RETREAT"], H_STD, 5.0)
             print("[DEBUG] retreat command issued.")
             
-            # 0:10–0:15 Approach again to 1 m in front of dancer
+            # 0:10–0:15 Approach again to center front
             goto(hl, POINTS["CENTER"], H_STD, 5.0)
             print("[DEBUG] center command issued.")
             
@@ -240,7 +240,7 @@ def main():
             # Main Dance (0:16–3:30)
             # =========================
 
-            # 0:16–0:20 Fly right (~1 m)
+            # 0:16–0:20 Fly right
             goto(hl, POINTS["RIGHT"], H_STD, 4.0)
             print("[DEBUG] right command issued.")
             
@@ -250,7 +250,7 @@ def main():
             # 0:23–0:29 Back to center
             goto(hl, POINTS["CENTER"], H_STD, 6.0)
 
-            # 0:30–0:36 Fly left (~1 m)
+            # 0:30–0:36 Fly left
             goto(hl, POINTS["LEFT"], H_STD, 6.0)
 
             # 0:37–0:40 Hover
@@ -260,14 +260,12 @@ def main():
             goto(hl, POINTS["CENTER"], H_STD, 6.0)
 
             # 0:46–1:15 Circle around performer (flat at 1.5m height), end at center front
-            # Circle center = performer position (0, 0), radius = 0.8m
-            # Center front is at (0, 1.0) which is 1.0m from origin
-            # Since radius is 0.8m, center front is OUTSIDE the circle!
-            # We need to move to the circle's starting point first (top of circle at 90°)
-            # Top of circle: (0, 0.8) when radius=0.8m and center=(0,0)
             
             # Move to top of circle to start
-            goto(hl, (0.0, 1.0), H_STD, 0.5)
+            # NOTE: The circle radius (0.7m) is larger than the center front Y (0.5m).
+            # We will start the circle from 90 degrees (0.0, 0.7)
+            # First, move from (0, 0.5) to (0, 0.7)
+            goto(hl, (0.0, CIRCLE_R), H_STD, 0.5)
             
             # First circle (14.5 seconds) - faster orbit
             start_angle_deg = 90.0
