@@ -45,7 +45,7 @@ H_MAX   = 2.0    # spiral/wave max height (m)
 CENTER_FRONT_Y = 0.5
 
 RETREAT_DIST = 1.5  # additional distance back from center front (m)
-SIDE_DIST    = 0.5  # left/right from center line (m) (Original 1.0m)
+SIDE_DIST    = 1.0  # left/right from center line (m) (Original 1.0m)
 CIRCLE_R     = 0.7 # orbit radius around performer (m) (Original 1.2m)
 
 # Diagonal movement parameters (1:26-1:50)
