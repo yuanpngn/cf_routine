@@ -45,14 +45,14 @@ H_MAX   = 2.0    # spiral/wave max height (m)
 CENTER_FRONT_Y = 0.5
 
 RETREAT_DIST = 1.5  # additional distance back from center front (m)
-SIDE_DIST    = 0.5  # left/right from center line (m) (Original 1.0m)
+SIDE_DIST    = 1.0  # left/right from center line (m) (Original 1.0m)
 CIRCLE_R     = 0.7 # orbit radius around performer (m) (Original 1.2m)
 
 # Diagonal movement parameters (1:26-1:50)
 DIAG_HORIZONTAL = 1.0  # horizontal distance per diagonal pass (m) (Original 1.5m)
 DIAG_VERTICAL   = 0.4  # height change per diagonal pass (m) - reduced from 0.7 for gentler slope
 
-ASCENT_VEL   = 0.7
+ASCENT_VEL   = 0.25 # take off much slower; approx. 0.25 meter per second; will take around 5 seconds to reach 1.3 meters (std.height)
 DESCENT_VEL  = 0.125
 
 FACE_CENTER  = True
